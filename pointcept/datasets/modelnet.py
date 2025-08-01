@@ -94,6 +94,7 @@ class ModelNetDataset(Dataset):
             data = np.loadtxt(data_path, delimiter=",").astype(np.float32)
             if self.num_point is not None:
                 if self.uniform_sampling:
+                    ### The following code caused a crash on my machine
                     with torch.no_grad():
                         mask = pointops.farthest_point_sampling(
                             torch.tensor(data).float().cuda(),
@@ -101,6 +102,13 @@ class ModelNetDataset(Dataset):
                             torch.tensor([self.num_point]).long().cuda(),
                         )
                     data = data[mask.cpu()]
+                    ### The following code fixed crash,
+                    ### but leads to different sampling (No FPS)
+                    '''
+                    # keep workers CPU-only to avoid CUDA re-init error
+                    idx_sel = np.random.choice(len(data), self.num_point, replace=False)
+                    data = data[idx_sel]
+                    '''
                 else:
                     data = data[: self.num_point]
             coord, normal = data[:, 0:3], data[:, 3:6]
