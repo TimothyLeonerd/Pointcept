@@ -42,12 +42,18 @@ class PointTransformerLayer(nn.Module):
         )
         self.softmax = nn.Softmax(dim=1)
 
-    def forward(self, pxo) -> torch.Tensor:
+    def forward(self, pxo, idx_override=None) -> torch.Tensor:
         p, x, o = pxo  # (n, 3), (n, c), (b)
         x_q, x_k, x_v = self.linear_q(x), self.linear_k(x), self.linear_v(x)
-        x_k, idx = pointops.knn_query_and_group(
-            x_k, p, o, new_xyz=p, new_offset=o, nsample=self.nsample, with_xyz=True
-        )
+        # ToDo: Is this really necessary? Why not do same as below with x_v calc
+        if idx_override is not None:              # Override knn_query
+            idx = idx_override
+            x_k = pointops.grouping(idx, x_k, p, new_xyz=p, with_xyz=True)
+        else:
+            x_k, idx = pointops.knn_query_and_group(
+                x_k, p, o, new_xyz=p, new_offset=o,
+                nsample=self.nsample, with_xyz=True
+            )
         x_v, _ = pointops.knn_query_and_group(
             x_v,
             p,
@@ -173,6 +179,8 @@ class Bottleneck(nn.Module):
 
     def __init__(self, in_planes, planes, share_planes=8, nsample=16):
         super(Bottleneck, self).__init__()
+        print("In Bottleneck")
+        print("nsample: ", nsample)
         self.linear1 = nn.Linear(in_planes, planes, bias=False)
         self.bn1 = nn.BatchNorm1d(planes)
         self.transformer = PointTransformerLayer(planes, planes, share_planes, nsample)
@@ -181,11 +189,13 @@ class Bottleneck(nn.Module):
         self.bn3 = nn.BatchNorm1d(planes * self.expansion)
         self.relu = nn.ReLU(inplace=True)
 
-    def forward(self, pxo):
+    def forward(self, pxo, idx_override=None):
         p, x, o = pxo  # (n, 3), (n, c), (b)
         identity = x
         x = self.relu(self.bn1(self.linear1(x)))
-        x = self.relu(self.bn2(self.transformer([p, x, o])))
+        x = self.relu(
+            self.bn2(self.transformer([p, x, o], idx_override=idx_override))
+        )
         x = self.bn3(self.linear3(x))
         x += identity
         x = self.relu(x)

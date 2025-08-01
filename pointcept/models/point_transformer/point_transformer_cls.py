@@ -89,6 +89,7 @@ class PointTransformerCls(nn.Module):
         x0 = data_dict["feat"]
         o0 = data_dict["offset"].int()
         x0 = p0 if self.in_channels == 3 else torch.cat((p0, x0), 1)
+               
         p1, x1, o1 = self.enc1([p0, x0, o0])
         p2, x2, o2 = self.enc2([p1, x1, o1])
         p3, x3, o3 = self.enc3([p2, x2, o2])
@@ -119,7 +120,7 @@ class PointTransformerCls26(PointTransformerCls):
 class PointTransformerCls38(PointTransformerCls):
     def __init__(self, **kwargs):
         super(PointTransformerCls38, self).__init__(
-            Bottleneck, [1, 2, 2, 2, 2], **kwargs
+            Bottleneck, [2, 2, 2, 2, 2], **kwargs
         )
 
 
@@ -129,3 +130,39 @@ class PointTransformerCls50(PointTransformerCls):
         super(PointTransformerCls50, self).__init__(
             Bottleneck, [1, 2, 3, 5, 2], **kwargs
         )
+    
+@MODELS.register_module()
+class PTv1Cls38_Features(PointTransformerCls38):
+    """PT-v1 (38 blocks) backbone that outputs global features only."""
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        del self.cls  # drop classifier head
+
+    def forward(self, data_dict):
+        p0, x0, o0 = data_dict["coord"], data_dict["feat"], data_dict["offset"].int()
+        idx0 = data_dict["inst_idx"]
+        
+        if self.in_channels != 3:
+            x0 = torch.cat((p0, x0), 1)
+
+        # ---- instance-aware neighbourhood in enc1 --------------------------
+        p1, x1, o1 = self.enc1[0]([p0, x0, o0])          # TransitionDown
+
+        # first Bottleneck of enc1 gets idx_override
+        #p1, x1, o1 = self.enc1[1]([p1, x1, o1], idx_override=idx0)
+        p1, x1, o1 = self.enc1[1]([p1, x1, o1]) # original version
+
+        # remaining Bottlenecks (if any)
+        for blk in self.enc1[2:]:
+            p1, x1, o1 = blk([p1, x1, o1])
+
+        p2, x2, o2 = self.enc2([p1, x1, o1])
+        p3, x3, o3 = self.enc3([p2, x2, o2])
+        p4, x4, o4 = self.enc4([p3, x3, o3])
+        _,  x5, o5 = self.enc5([p4, x4, o4])
+
+        feats = torch.stack([
+            x5[(o5[i-1] if i else 0):o5[i]].mean(0)
+            for i in range(o5.shape[0])
+        ])
+        return feats  # (B, 512)
