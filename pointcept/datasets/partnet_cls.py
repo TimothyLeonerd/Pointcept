@@ -5,6 +5,9 @@ import json
 import h5py
 import numpy as np
 
+import torch
+import pointops
+
 from .defaults import DefaultDataset
 from .builder  import DATASETS
 
@@ -24,6 +27,7 @@ class PartNetClsDataset(DefaultDataset):
         self,
         split="train",
         data_root="data/ins_seg_h5/ins_seg_h5",
+        same_inst_mode="knn",
         class_names=None,
         transform=None,
         cache=False,
@@ -36,6 +40,8 @@ class PartNetClsDataset(DefaultDataset):
 
         # discard keys DefaultDataset doesn't recognise
         kwargs.pop("num_points", None)        # not used (we keep full 10 k)
+
+        self.same_inst_mode = same_inst_mode.lower()
 
         # ---------- delegate to parent -----------------------------------
         super().__init__(
@@ -98,9 +104,52 @@ class PartNetClsDataset(DefaultDataset):
             coord = f["pts"][row]                 # (10000,3)
             inst  = f["label"][row]        # (10000,) int32
 
-        inst_idx = self.build_same_inst_idx(inst) # (N,16)
+
+
+        if self.same_inst_mode == "random":
+            inst_idx = self.build_same_inst_idx(inst)
+        else:   # "knn"
+            coord_t = torch.from_numpy(coord).float()  # for knn_query
+            inst_idx = self.inst_knn_same(inst, coord_t)
+
+
         return dict(
             coord    = coord.astype(np.float32),
             category = np.array([cat_id], dtype=np.int64),
             inst_idx = inst_idx,   
         )
+
+    def inst_knn_same(self, idx_label, xyz, nsample=16):
+        """
+        idx_label : (N,) int32  – instance id per point (-1: ignore)
+        xyz       : (N,3) float32 tensor
+        returns   : (N, nsample) int32 with neighbours *within the same instance*
+                    padding with -1 if an instance has < nsample points.
+        """
+        # 1) permute points so all points of one instance are contiguous
+        order = np.argsort(idx_label)
+        inv   = np.zeros_like(order);  inv[order] = np.arange(len(order))
+        xyz_sorted  = xyz[order]                   # torch tensor
+        inst_sorted = idx_label[order]
+
+        # 2) build offset: cumulative counts per instance
+        unique, counts = np.unique(inst_sorted, return_counts=True)
+        # drop the background label −1 (if present)
+        mask_keep = unique >= 0
+        unique, counts = unique[mask_keep], counts[mask_keep]
+        offset = np.cumsum(counts).astype(np.int32)               # (M,)
+        offset = torch.from_numpy(offset).to(xyz.device)
+
+        # 3) run CUDA k-NN
+        idx_sorted, _ = pointops.knn_query(
+            nsample,
+            xyz_sorted, offset,
+            xyz_sorted, offset
+        )                                              # (N, nsample)
+
+        # 4) map indices back to original order and undo the sort
+        idx_sorted = idx_sorted.cpu().numpy()
+        idx_sorted[idx_sorted < 0] = -1               # safety
+        idx_original = order[idx_sorted]               # still (N,nsample)
+        idx_original = idx_original[inv]               # restore original order
+        return idx_original.astype(np.int32)
