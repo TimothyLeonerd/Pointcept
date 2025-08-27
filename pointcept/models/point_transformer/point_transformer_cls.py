@@ -5,7 +5,85 @@ import pointops
 
 from .point_transformer_seg import TransitionDown, Bottleneck
 from pointcept.models.builder import MODELS
+from .utils import LayerNorm1d
 
+
+# ------------------------------ helper: CLS cross-attention ------------------------------
+class _GlobalCLSCrossAttn(nn.Module):
+    """
+    Single-query (CLS) cross-attention over a set of tokens from one stage.
+    - token_in_dim:  channel dimension of the stage tokens (C_s)
+    - cls_dim:       shared CLS dimension (we use the final stage dim, 512)
+    """
+    def __init__(self, token_in_dim: int, cls_dim: int):
+        super().__init__()
+        self.cls_dim = cls_dim
+
+        # PreNorm on tokens and CLS (Transformer-style)
+        self.ln_x   = nn.LayerNorm(token_in_dim)
+        self.ln_cls = nn.LayerNorm(cls_dim)
+
+        # Linear projections to shared attention space (D = cls_dim)
+        self.w_q = nn.Linear(cls_dim,     cls_dim, bias=False)
+        self.w_k = nn.Linear(token_in_dim, cls_dim, bias=False)
+        self.w_v = nn.Linear(token_in_dim, cls_dim, bias=False)
+
+        # Small MLP on CLS with residual for stability
+        self.mlp = nn.Sequential(
+            nn.LayerNorm(cls_dim),
+            nn.Linear(cls_dim, 4 * cls_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(4 * cls_dim, cls_dim),
+        )
+
+        self.scale = cls_dim ** 0.5  # √D
+
+    def forward(self, x: torch.Tensor, o: torch.Tensor, cls: torch.Tensor) -> torch.Tensor:
+        """
+        x   : (N, C_s)  concatenated tokens
+        o   : (B,)      cumulative counts
+        cls : (B, D)    current CLS per batch
+        returns         updated CLS (B, D)
+        """
+        x = self.ln_x(x)           # normalize tokens once
+        cls_in = self.ln_cls(cls)  # normalize CLS once (no in-place)
+
+        B = o.shape[0]
+        s_prev = 0
+        cls_out = []               # collect updated CLS per sample (avoid in-place)
+
+        for b in range(B):
+            s = s_prev
+            e = o[b].item()
+            s_prev = e
+
+            xb = x[s:e]                          # (Nb, C_s)
+            if xb.numel() == 0:
+                # no tokens for this sample; just carry forward the old CLS
+                cls_out.append(cls[b])
+                continue
+
+            # project tokens -> K, V in shared dim D
+            K = self.w_k(xb)                     # (Nb, D)
+            V = self.w_v(xb)                     # (Nb, D)
+
+            # single-query from this sample’s CLS
+            q = self.w_q(cls_in[b:b+1]).squeeze(0)   # (D,)
+
+            # attention weights over tokens
+            logits = (K @ q) / self.scale            # (Nb,)
+            attn = torch.softmax(logits, dim=0)      # (Nb,)
+
+            # aggregate values
+            out = attn @ V                            # (D,)
+
+            # residual + MLP (all out-of-place)
+            cls_b = cls[b] + out
+            cls_b = cls_b + self.mlp(cls_b)
+
+            cls_out.append(cls_b)
+
+        return torch.stack(cls_out, dim=0)       # (B, D)
 
 class PointTransformerCls(nn.Module):
     def __init__(self, block, blocks, in_channels=6, num_classes=40):
@@ -121,13 +199,35 @@ class PointTransformerCls38(PointTransformerCls):
         super().__init__(Bottleneck, [2, 2, 2, 2, 2], **kwargs)
 
 
-# ===== features-only backbones for DefaultClassifier =====
-
+# ===== features-only backbone with instance-aware KNN + CLS token =====
 @MODELS.register_module()
 class PTv1Cls38_Features(PointTransformerCls38):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        del self.cls  # backbone only
+        del self.cls  # backbone only (DefaultClassifier will provide the head)
+
+        # -------- derive per-stage output channel dims from TD BN layers -------
+        # encX[0] is TransitionDown; its BN has num_features == stage output C
+        c1 = self.enc1[0].bn.num_features
+        c2 = self.enc2[0].bn.num_features
+        c3 = self.enc3[0].bn.num_features
+        c4 = self.enc4[0].bn.num_features
+        c5 = self.enc5[0].bn.num_features
+        self._stage_dims = (c1, c2, c3, c4, c5)
+
+        # -------- shared CLS dimension = last stage channels (512) ------------
+        self.cls_dim = c5
+
+        # -------- learnable CLS query (one per batch, expanded at runtime) ----
+        self.cls_token = nn.Parameter(torch.zeros(1, self.cls_dim))
+        nn.init.normal_(self.cls_token, std=0.02)  # small init like ViT
+
+        # -------- per-stage cross-attention mixers (tokens -> CLS) ------------
+        self.cls_attn1 = _GlobalCLSCrossAttn(token_in_dim=c1, cls_dim=self.cls_dim)
+        self.cls_attn2 = _GlobalCLSCrossAttn(token_in_dim=c2, cls_dim=self.cls_dim)
+        self.cls_attn3 = _GlobalCLSCrossAttn(token_in_dim=c3, cls_dim=self.cls_dim)
+        self.cls_attn4 = _GlobalCLSCrossAttn(token_in_dim=c4, cls_dim=self.cls_dim)
+        self.cls_attn5 = _GlobalCLSCrossAttn(token_in_dim=c5, cls_dim=self.cls_dim)
 
     # ----- helper: run one encoder (enc1..enc5) with instance-aware KNN on its first block
     @staticmethod
@@ -146,29 +246,24 @@ class PTv1Cls38_Features(PointTransformerCls38):
         # 2) propagate instance labels through FPS mapping
         inst_new = None
         if inst is not None:
-            # make sure 'inst' is on the same device and is long
             inst = inst.to(p_new.device).to(torch.long)
             if td.last_down_idx is None:
-                # stride == 1 (e.g., enc1): positions unchanged → labels unchanged
-                inst_new = inst
+                inst_new = inst                   # stride==1: labels unchanged
             else:
-                # copy labels via FPS indices (global indices)
-                inst_new = inst[td.last_down_idx.long()]
+                inst_new = inst[td.last_down_idx.long()]  # map via FPS indices
 
         # 3) instance-aware KNN for the FIRST block only (if it exists and we have labels)
         if len(enc) > 1 and inst_new is not None:
             first_block = enc[1]
-            ns = first_block.transformer.nsample  # nsample setting of this block
-            # build same-instance neighbors under current batch partition 'o_new'
+            ns = first_block.transformer.nsample
             idx_override = PointTransformerCls._build_inst_knn_batch(
                 p_new, inst_new, o_new, nsample=ns
             )
             p_new, x_new, o_new = first_block([p_new, x_new, o_new], idx_override=idx_override)
-            # run any remaining blocks normally
+            # remaining blocks (if any) run normally
             for i in range(2, len(enc)):
                 p_new, x_new, o_new = enc[i]([p_new, x_new, o_new])
         else:
-            # no labels or no blocks beyond TD → run remaining blocks (if any) normally
             for i in range(1, len(enc)):
                 p_new, x_new, o_new = enc[i]([p_new, x_new, o_new])
 
@@ -176,24 +271,34 @@ class PTv1Cls38_Features(PointTransformerCls38):
 
     def forward(self, data_dict):
         # inputs
-        p0 = data_dict["coord"]                 # (N,3)
-        x0 = data_dict["feat"]                  # (N,C)  (often zeros if using xyz only)
-        o0 = data_dict["offset"].int()          # (B,)
-        inst0 = data_dict.get("instance", None) # (N,) long/int per-point instance id
+        p0   = data_dict["coord"]                  # (N,3)
+        x0in = data_dict["feat"]                   # (N,C) (often zeros if xyz-only)
+        o0   = data_dict["offset"].int()           # (B,)
+        inst0= data_dict.get("instance", None)     # (N,) optional per-point instance id
 
-        # features: xyz-only if in_channels==3, else concat (unchanged behavior)
-        x0 = p0 if self.in_channels == 3 else torch.cat((p0, x0), 1)
+        # feature input: xyz-only if in_channels==3, else concat (unchanged)
+        x0 = p0 if self.in_channels == 3 else torch.cat((p0, x0in), 1)
+
+        # initialize per-batch CLS by expanding the learnable token
+        B = o0.shape[0]
+        # Use repeat (real copies) instead of expand (view with as_strided)
+        cls = self.cls_token.repeat(B, 1)   # (B, 512)
 
         # enc1..enc5 with instance-aware KNN applied to the first block of each encoder
         p1, x1, o1, inst1 = self._run_stage_with_inst_knn(self.enc1, p0, x0, o0, inst0)
-        p2, x2, o2, inst2 = self._run_stage_with_inst_knn(self.enc2, p1, x1, o1, inst1)
-        p3, x3, o3, inst3 = self._run_stage_with_inst_knn(self.enc3, p2, x2, o2, inst2)
-        p4, x4, o4, inst4 = self._run_stage_with_inst_knn(self.enc4, p3, x3, o3, inst3)
-        _,  x5, o5, _     = self._run_stage_with_inst_knn(self.enc5, p4, x4, o4, inst4)
+        cls = self.cls_attn1(x1, o1, cls)  # CLS cross-attends to stage-1 tokens
 
-        # global pooling per batch (unchanged)
-        feats = torch.stack([
-            x5[(o5[i-1] if i else 0):o5[i]].mean(0)
-            for i in range(o5.shape[0])
-        ])
-        return feats
+        p2, x2, o2, inst2 = self._run_stage_with_inst_knn(self.enc2, p1, x1, o1, inst1)
+        cls = self.cls_attn2(x2, o2, cls)  # stage-2
+
+        p3, x3, o3, inst3 = self._run_stage_with_inst_knn(self.enc3, p2, x2, o2, inst2)
+        cls = self.cls_attn3(x3, o3, cls)  # stage-3
+
+        p4, x4, o4, inst4 = self._run_stage_with_inst_knn(self.enc4, p3, x3, o3, inst3)
+        cls = self.cls_attn4(x4, o4, cls)  # stage-4
+
+        _,  x5, o5, _     = self._run_stage_with_inst_knn(self.enc5, p4, x4, o4, inst4)
+        cls = self.cls_attn5(x5, o5, cls)  # stage-5
+
+        # Return the final CLS features (B, 512). DefaultClassifier will map to logits.
+        return cls
