@@ -77,24 +77,24 @@ class TransitionDown(nn.Module):
         self.bn = nn.BatchNorm1d(out_planes)
         self.relu = nn.ReLU(inplace=True)
 
-        # Will hold the FPS mapping from previous level → this level (set in forward)
+        # cached mapping from previous level → current level (set at forward)
         self.last_down_idx = None
 
     def forward(self, pxo):
         p, x, o = pxo
         if self.stride != 1:
-            # Compute how many samples per batch element after downsampling
+            # compute new offsets after downsampling
             n_o, count = [o[0].item() // self.stride], o[0].item() // self.stride
             for i in range(1, o.shape[0]):
                 count += (o[i].item() - o[i - 1].item()) // self.stride
                 n_o.append(count)
             n_o = torch.cuda.IntTensor(n_o)
 
-            # FPS selects a subset of points; idx maps new points back to old indices
+            # farthest-point sampling; idx maps new points onto old indices
             idx = pointops.farthest_point_sampling(p, o, n_o)  # (m,)
-            self.last_down_idx = idx.long()  # <-- cache mapping (global indexing)
+            self.last_down_idx = idx.long()  # <-- cache for label propagation
 
-            n_p = p[idx.long(), :]  # select the FPS-sampled coordinates
+            n_p = p[idx.long(), :]  # downsampled coords
             x, _ = pointops.knn_query_and_group(
                 x, p, offset=o, new_xyz=n_p, new_offset=n_o,
                 nsample=self.nsample, with_xyz=True
@@ -103,11 +103,10 @@ class TransitionDown(nn.Module):
             x = self.pool(x).squeeze(-1)
             p, o = n_p, n_o
         else:
-            # No downsample → no mapping; make that explicit
+            # no downsample at this stage
             self.last_down_idx = None
             x = self.relu(self.bn(self.linear(x)))
         return [p, x, o]
-
 
 
 class TransitionUp(nn.Module):

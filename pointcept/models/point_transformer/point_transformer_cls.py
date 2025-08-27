@@ -129,66 +129,71 @@ class PTv1Cls38_Features(PointTransformerCls38):
         super().__init__(**kwargs)
         del self.cls  # backbone only
 
+    # ----- helper: run one encoder (enc1..enc5) with instance-aware KNN on its first block
+    @staticmethod
+    def _run_stage_with_inst_knn(enc: nn.Sequential, p, x, o, inst):
+        """
+        enc   : nn.Sequential [ TransitionDown, Block1, Block2, ... ]
+        p,x,o : inputs of this stage
+        inst  : per-point instance ids aligned with 'p' (or None)
+
+        returns: (p_new, x_new, o_new, inst_new)
+        """
+        # 1) always run the stage's TransitionDown first
+        td = enc[0]
+        p_new, x_new, o_new = td([p, x, o])
+
+        # 2) propagate instance labels through FPS mapping
+        inst_new = None
+        if inst is not None:
+            # make sure 'inst' is on the same device and is long
+            inst = inst.to(p_new.device).to(torch.long)
+            if td.last_down_idx is None:
+                # stride == 1 (e.g., enc1): positions unchanged → labels unchanged
+                inst_new = inst
+            else:
+                # copy labels via FPS indices (global indices)
+                inst_new = inst[td.last_down_idx.long()]
+
+        # 3) instance-aware KNN for the FIRST block only (if it exists and we have labels)
+        if len(enc) > 1 and inst_new is not None:
+            first_block = enc[1]
+            ns = first_block.transformer.nsample  # nsample setting of this block
+            # build same-instance neighbors under current batch partition 'o_new'
+            idx_override = PointTransformerCls._build_inst_knn_batch(
+                p_new, inst_new, o_new, nsample=ns
+            )
+            p_new, x_new, o_new = first_block([p_new, x_new, o_new], idx_override=idx_override)
+            # run any remaining blocks normally
+            for i in range(2, len(enc)):
+                p_new, x_new, o_new = enc[i]([p_new, x_new, o_new])
+        else:
+            # no labels or no blocks beyond TD → run remaining blocks (if any) normally
+            for i in range(1, len(enc)):
+                p_new, x_new, o_new = enc[i]([p_new, x_new, o_new])
+
+        return p_new, x_new, o_new, inst_new
+
     def forward(self, data_dict):
-        p0, x0, o0 = data_dict["coord"], data_dict["feat"], data_dict["offset"].int()
-        inst = data_dict.get("instance", None)  # (N,) per-point instance id at level-0
-        # If using xyz only, replace feat with xyz; else concatenate
+        # inputs
+        p0 = data_dict["coord"]                 # (N,3)
+        x0 = data_dict["feat"]                  # (N,C)  (often zeros if using xyz only)
+        o0 = data_dict["offset"].int()          # (B,)
+        inst0 = data_dict.get("instance", None) # (N,) long/int per-point instance id
+
+        # features: xyz-only if in_channels==3, else concat (unchanged behavior)
         x0 = p0 if self.in_channels == 3 else torch.cat((p0, x0), 1)
 
-        # -------- enc1: TD (stride=1) + first block with instance-aware KNN -----
-        # TD at enc1 has stride=1 → no FPS (p1 == p0) and no index mapping needed.
-        p1, x1, o1 = self.enc1[0]([p0, x0, o0])
+        # enc1..enc5 with instance-aware KNN applied to the first block of each encoder
+        p1, x1, o1, inst1 = self._run_stage_with_inst_knn(self.enc1, p0, x0, o0, inst0)
+        p2, x2, o2, inst2 = self._run_stage_with_inst_knn(self.enc2, p1, x1, o1, inst1)
+        p3, x3, o3, inst3 = self._run_stage_with_inst_knn(self.enc3, p2, x2, o2, inst2)
+        p4, x4, o4, inst4 = self._run_stage_with_inst_knn(self.enc4, p3, x3, o3, inst3)
+        _,  x5, o5, _     = self._run_stage_with_inst_knn(self.enc5, p4, x4, o4, inst4)
 
-        idx_override = None
-        if len(self.enc1) > 1 and inst is not None:
-            # Build same-instance KNN for level-1 (p1). Since stride=1, inst@p1 == inst@p0.
-            idx_override = PointTransformerCls._build_inst_knn_batch(
-                p1, inst, o1, nsample=self.enc1[1].transformer.nsample
-            )
-            # Feed first block with the override (subsequent blocks in enc1 use default KNN)
-            p1, x1, o1 = self.enc1[1]([p1, x1, o1], idx_override=idx_override)
-            # Run any remaining blocks in enc1 (if present)
-            for i in range(2, len(self.enc1)):
-                p1, x1, o1 = self.enc1[i]([p1, x1, o1])
-        else:
-            # No instance info or only TD exists → run the rest (if any) normally
-            for i in range(1, len(self.enc1)):
-                p1, x1, o1 = self.enc1[i]([p1, x1, o1])
-
-        # -------- enc2: TD (stride=4) + first block with instance-aware KNN -----
-        # Break the sequential: first call TD to get FPS mapping p1 -> p2.
-        p2, x2, o2 = self.enc2[0]([p1, x1, o1])
-
-        # Pull FPS indices from the TD to map instance ids from level-1 to level-2
-        inst2 = None
-        if inst is not None:
-            down_idx2 = getattr(self.enc2[0], "last_down_idx", None)  # (|p2|,)
-            if down_idx2 is not None:
-                # inst is aligned with p1; since enc1 TD had stride=1, inst@p1 == inst@p0
-                # Copy instance labels to level-2 by direct indexing with FPS mapping
-                inst2 = inst[down_idx2.long()]
-
-        # Build same-instance KNN at level-2 (only for the first block of enc2)
-        if len(self.enc2) > 1 and inst2 is not None:
-            idx_override2 = PointTransformerCls._build_inst_knn_batch(
-                p2, inst2, o2, nsample=self.enc2[1].transformer.nsample
-            )
-            p2, x2, o2 = self.enc2[1]([p2, x2, o2], idx_override=idx_override2)
-            # Run any remaining blocks in enc2 (if present)
-            for i in range(2, len(self.enc2)):
-                p2, x2, o2 = self.enc2[i]([p2, x2, o2])
-        else:
-            # Fallback: run enc2 blocks normally
-            for i in range(1, len(self.enc2)):
-                p2, x2, o2 = self.enc2[i]([p2, x2, o2])
-
-        # -------- enc3..enc5 unchanged (regular KNN) ----------------------------
-        p3, x3, o3 = self.enc3([p2, x2, o2])
-        p4, x4, o4 = self.enc4([p3, x3, o3])
-        _,  x5, o5 = self.enc5([p4, x4, o4])
-
-        # Global average per batch (same as your current code)
+        # global pooling per batch (unchanged)
         feats = torch.stack([
-            x5[(o5[i-1] if i else 0):o5[i]].mean(0) for i in range(o5.shape[0])
+            x5[(o5[i-1] if i else 0):o5[i]].mean(0)
+            for i in range(o5.shape[0])
         ])
         return feats
