@@ -1,25 +1,26 @@
 # --------------------------------------------------------------
 #  Point Transformer v1  ▸  PartNet‑24 shape‑level classification
 # --------------------------------------------------------------
-_base_ = ["../_base_/default_runtime.py"]   # keep relative path as in other configs
-seed = 58241877                             # explicit so "cfg.seed" always exists
+# configs/partnet/ptv1-cls38.py
+_base_ = ["../_base_/default_runtime.py"]
+seed = 58241877
 
-# ------------- misc --------------------------------------------------------
-batch_size         = 8     # total across all GPUs (adjust to VRAM)
-batch_size_val     = 16
-batch_size_test    = 16
-num_worker         = 4
-empty_cache        = False
-enable_amp         = False     # AMP off for first experiments
+# misc
+batch_size = 8
+batch_size_val = 16
+batch_size_test = 16
+num_worker = 4
+empty_cache = False
+enable_amp = False
 
-# ------------- model -------------------------------------------------------
+# model
 model = dict(
     type="DefaultClassifier",
     num_classes=24,
     backbone_embed_dim=512,
     backbone=dict(
-        type="PTv1Cls38_Features",    # backbone file exists in Pointcept
-        in_channels=3                 # xyz only
+        type="PTv1Cls38_Features",
+        in_channels=3,     # xyz only (we feed coord as feat)
     ),
     criteria=[
         dict(type="CrossEntropyLoss", loss_weight=1.0, ignore_index=-1),
@@ -27,11 +28,11 @@ model = dict(
     ],
 )
 
-# ------------- optimiser & scheduler --------------------------------------
-epoch      = 10
+# schedule
+epoch = 10
 eval_epoch = epoch
-optimizer  = dict(type="AdamW", lr=0.001, weight_decay=0.01)
-scheduler  = dict(
+optimizer = dict(type="AdamW", lr=0.001, weight_decay=0.01)
+scheduler = dict(
     type="OneCycleLR",
     max_lr=[0.001, 0.0001],
     pct_start=0.05,
@@ -41,15 +42,14 @@ scheduler  = dict(
 )
 param_dicts = [dict(keyword="block", lr=0.0001)]
 
-# ------------- dataset -----------------------------------------------------
+# dataset
 dataset_type = "PartNetClsDataset"
-data_root    = "data/ins_seg_h5/ins_seg_h5"      # adjust if you move the bundle
-
+data_root    = "data/ins_seg_h5/ins_seg_h5"
 class_names = [
-    "Bag", "Bed", "Bottle", "Bowl", "Chair", "Clock",
-    "Dishwasher", "Display", "Door", "Earphone", "Faucet", "Hat",
-    "Keyboard", "Knife", "Lamp", "Laptop", "Microwave", "Mug",
-    "Refrigerator", "Scissors", "StorageFurniture", "Table", "TrashCan", "Vase",
+    "Bag","Bed","Bottle","Bowl","Chair","Clock",
+    "Dishwasher","Display","Door","Earphone","Faucet","Hat",
+    "Keyboard","Knife","Lamp","Laptop","Microwave","Mug",
+    "Refrigerator","Scissors","StorageFurniture","Table","TrashCan","Vase",
 ]
 
 data = dict(
@@ -59,22 +59,20 @@ data = dict(
     train=dict(
         type=dataset_type,
         split="train",
-        same_inst_mode="knn",   # <-- use "knn" or "random"
         loop=1,
-        num_points=1024,
         data_root=data_root,
         class_names=class_names,
         transform=[
             dict(type="NormalizeCoord"),
             dict(type="RandomScale", scale=[0.7, 1.5], anisotropic=True),
             dict(type="RandomShift", shift=((-0.2, 0.2), (-0.2, 0.2), (-0.2, 0.2))),
-            #dict(type="GridSample", grid_size=0.01, hash_type="fnv", mode="train", return_grid_coord=True,),
+            # Optional: you can keep ShufflePoint. It should permute 'instance' too.
             dict(type="ShufflePoint"),
             dict(type="ToTensor"),
             dict(
                 type="Collect",
-                keys=("coord", "category", "inst_idx"),
-                feat_keys=["coord"],
+                keys=("coord", "category", "instance"),  # ← collect instance ids
+                feat_keys=["coord"],                     # feed xyz as features
             ),
         ],
         test_mode=False,
@@ -82,17 +80,15 @@ data = dict(
     val=dict(
         type=dataset_type,
         split="test",
-        same_inst_mode="knn",   # <-- use "knn" or "random"
         loop=1,
         data_root=data_root,
         class_names=class_names,
         transform=[
             dict(type="NormalizeCoord"),
-            #dict(type="GridSample", grid_size=0.01, hash_type="fnv", mode="train", return_grid_coord=True,),
             dict(type="ToTensor"),
             dict(
                 type="Collect",
-                keys=("coord", "category", "inst_idx"),
+                keys=("coord", "category", "instance"),
                 feat_keys=["coord"],
             ),
         ],
@@ -100,7 +96,7 @@ data = dict(
     ),
 )
 
-# ------------- runtime hooks -----------------------------------------------
+# hooks
 hooks = [
     dict(type="CheckpointLoader"),
     dict(type="IterationTimer", warmup_iter=2),
