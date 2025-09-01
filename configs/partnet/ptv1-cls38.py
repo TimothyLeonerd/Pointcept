@@ -21,6 +21,7 @@ model = dict(
     backbone=dict(
         type="PTv1Cls38_Features",
         in_channels=3,     # xyz only (we feed coord as feat)
+        collect_attn_stats=True,
     ),
     criteria=[
         dict(type="CrossEntropyLoss", loss_weight=1.0, ignore_index=-1),
@@ -103,4 +104,5 @@ hooks = [
     dict(type="InformationWriter"),
     dict(type="ClsEvaluator"),
     dict(type="CheckpointSaver", save_freq=None),
+    dict(type="AttnStatsLogger", every_n_iters=200, every_n_epochs=1, tag_prefix="attn"),
 ]

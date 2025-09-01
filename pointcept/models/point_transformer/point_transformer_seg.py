@@ -34,7 +34,7 @@ class PointTransformerLayer(nn.Module):
         )
         self.softmax = nn.Softmax(dim=1)
 
-    def forward(self, pxo, idx_override=None) -> torch.Tensor:
+    def forward(self, pxo, idx_override=None, inst=None) -> torch.Tensor:
         p, x, o = pxo  # (n, 3), (n, c), (b)
         x_q, x_k, x_v = self.linear_q(x), self.linear_k(x), self.linear_v(x)
 
@@ -45,6 +45,21 @@ class PointTransformerLayer(nn.Module):
             x_k, idx = pointops.knn_query_and_group(
                 x_k, p, o, new_xyz=p, new_offset=o, nsample=self.nsample, with_xyz=True
             )
+
+        # ---- stats: % neighbors outside the same instance (pads excluded) ----
+        if getattr(self, "collect_attn_stats", False) and inst is not None:
+            valid = (idx >= 0)
+            if valid.any():
+                # safe gather: don't index with -1
+                idx_safe = torch.where(valid, idx, idx.new_zeros(()))
+                neigh_inst = inst[idx_safe.long()]
+                self_inst  = inst.unsqueeze(1).expand_as(idx)
+                mismatch = (neigh_inst != self_inst) & valid
+
+                # accumulate (ints to avoid GPU sync pressure)
+                self.stats_mismatch += int(mismatch.sum().item())
+                self.stats_valid    += int(valid.sum().item())
+                self.stats_calls    += 1
 
         x_v, _ = pointops.knn_query_and_group(
             x_v, p, o, new_xyz=p, new_offset=o, idx=idx, nsample=self.nsample, with_xyz=False
@@ -158,11 +173,11 @@ class Bottleneck(nn.Module):
         self.bn3 = nn.BatchNorm1d(planes * self.expansion)
         self.relu = nn.ReLU(inplace=True)
 
-    def forward(self, pxo, idx_override=None):
+    def forward(self, pxo, idx_override=None, inst=None, **_):
         p, x, o = pxo
         identity = x
         x = self.relu(self.bn1(self.linear1(x)))
-        x = self.relu(self.bn2(self.transformer([p, x, o], idx_override=idx_override)))
+        x = self.relu(self.bn2(self.transformer([p, x, o], idx_override=idx_override, inst=inst)))
         x = self.bn3(self.linear3(x))
         x += identity
         x = self.relu(x)

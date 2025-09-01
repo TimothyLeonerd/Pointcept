@@ -186,12 +186,16 @@ class PointTransformerCls(nn.Module):
                 mapped = order[idx_s[valid].long()] + start     # long
                 idx_b[valid] = mapped.to(torch.int)             # back to int32
 
-            out_idx[start:end] = idx_b
+            # UNSORT ROWS: scatter sorted rows back to original row order
+            # by inverse permutation
+            inv = torch.empty_like(order)
+            inv[order] = torch.arange(order.numel(), device=order.device)
+            out_idx[start:end] = idx_b[inv]   
+
             start = end
 
         return out_idx
-
-        
+    
 
 @MODELS.register_module("PointTransformer-Cls26")
 class PointTransformerCls26(PointTransformerCls):
@@ -209,6 +213,8 @@ class PointTransformerCls38(PointTransformerCls):
 @MODELS.register_module()
 class PTv1Cls38_Features(PointTransformerCls38):
     def __init__(self, **kwargs):
+        # remove custom kwarg so the base class never sees it
+        self.collect_attn_stats = bool(kwargs.pop("collect_attn_stats", False))
         super().__init__(**kwargs)
         del self.cls  # backbone only (DefaultClassifier will provide the head)
 
@@ -237,6 +243,16 @@ class PTv1Cls38_Features(PointTransformerCls38):
         self.cls_attn3 = _GlobalCLSCrossAttn(token_in_dim=c3, cls_dim=self.cls_dim)
         self.cls_attn4 = _GlobalCLSCrossAttn(token_in_dim=c4, cls_dim=self.cls_dim)
         self.cls_attn5 = _GlobalCLSCrossAttn(token_in_dim=c5, cls_dim=self.cls_dim)
+
+        if self.collect_attn_stats:
+            # enable stats only on the FIRST block’s transformer of each stage (one per level)
+            for enc in [self.enc1, self.enc2, self.enc3, self.enc4, self.enc5]:
+                if len(enc) > 1:
+                    tr = enc[1].transformer
+                    tr.collect_attn_stats = True
+                    tr.stats_mismatch = 0
+                    tr.stats_valid = 0
+                    tr.stats_calls = 0
 
     # ----- helper: run one encoder (enc1..enc5) with instance-aware KNN on its first block
     @staticmethod
@@ -268,10 +284,11 @@ class PTv1Cls38_Features(PointTransformerCls38):
             idx_override = PointTransformerCls._build_inst_knn_batch(
                 p_new, inst_new, o_new, nsample=ns
             )
-            p_new, x_new, o_new = first_block([p_new, x_new, o_new], idx_override=idx_override)
+
+            p_new, x_new, o_new = first_block([p_new, x_new, o_new], idx_override=idx_override, inst=inst_new)
             # remaining blocks (if any) run normally
             for i in range(2, len(enc)):
-                p_new, x_new, o_new = enc[i]([p_new, x_new, o_new])
+                p_new, x_new, o_new = enc[i]([p_new, x_new, o_new], inst=inst_new)
         else:
             for i in range(1, len(enc)):
                 p_new, x_new, o_new = enc[i]([p_new, x_new, o_new])
@@ -315,3 +332,18 @@ class PTv1Cls38_Features(PointTransformerCls38):
         )                                        # (B, 512)
         feats = pooled + self.gamma_cls * cls    # begins identical to pooled; learns to add CLS
         return feats
+    
+    def get_attn_stats(self, reset=False):
+        out = {}
+        for lvl, enc in enumerate([self.enc1, self.enc2, self.enc3, self.enc4, self.enc5], start=1):
+            if len(enc) > 1 and getattr(enc[1].transformer, "collect_attn_stats", False):
+                tr = enc[1].transformer
+                mismatch = int(tr.stats_mismatch)
+                valid    = int(tr.stats_valid)
+                pct = (100.0 * mismatch / valid) if valid > 0 else float("nan")
+                out[f"enc{lvl}"] = dict(mismatch=mismatch, valid=valid, pct=pct, calls=int(tr.stats_calls))
+                if reset:
+                    tr.stats_mismatch = 0
+                    tr.stats_valid = 0
+                    tr.stats_calls = 0
+        return out
