@@ -151,14 +151,14 @@ class PointTransformerCls(nn.Module):
     def _build_inst_knn_batch(p, inst, offset, nsample=16):
         """
         p      : (N,3) float (cuda)
-        inst   : (N,)  long  (cpu or cuda)  — per-point instance ids
+        inst   : (N,)  long  (cpu or cuda) — per-point instance ids
         offset : (B,)  int cumulative counts
-        return : (N, nsample) int (cuda) indices, neighbors within same instance (per cloud)
+        return : (N, nsample) int32 (cuda) indices; -1 = pad
         """
         device = p.device
         inst = inst.to(device).long()
         N = p.shape[0]
-        out_idx = torch.empty((N, nsample), dtype=torch.int, device=device)
+        out_idx = torch.empty((N, nsample), dtype=torch.int, device=device)  # int32
 
         start = 0
         for b in range(offset.shape[0]):
@@ -166,25 +166,31 @@ class PointTransformerCls(nn.Module):
             p_b = p[start:end].contiguous()
             i_b = inst[start:end].contiguous()
 
-            # sort points by instance id so each instance is contiguous
-            order = torch.argsort(i_b)
+            # sort by instance id so each instance is contiguous
+            order = torch.argsort(i_b)          # (Nb,) long
             p_s   = p_b[order]
             i_s   = i_b[order]
 
-            # counts per instance (on CUDA)
+            # counts per instance (CUDA)
             uniq, counts = torch.unique(i_s, return_counts=True)
-            # build int32 offset for knn_query
-            off = torch.cumsum(counts, dim=0).int()
+            off = torch.cumsum(counts, dim=0).int()   # (nInst,) int32 — pointops style
 
-            # run CUDA kNN within instances (search==query, offset==off)
-            idx_s, _ = pointops.knn_query(nsample, p_s, off, p_s, off)  # (Nb, nsample)
+            # kNN within instances (search==query, offset==off)
+            idx_s, _ = pointops.knn_query(nsample, p_s, off, p_s, off)  # (Nb, nsample), pads=-1
 
-            # map back to original indices within this cloud
-            idx_b = order[idx_s]              # (Nb, nsample)
-            out_idx[start:end] = idx_b + start
+            # map back to original indices but preserve pads (-1)
+            valid = idx_s >= 0                                  # (Nb, nsample) bool
+            idx_b = torch.full_like(idx_s, -1)                  # int32, stays -1 where padded
+            if valid.any():
+                # use long for tensor indexing
+                mapped = order[idx_s[valid].long()] + start     # long
+                idx_b[valid] = mapped.to(torch.int)             # back to int32
+
+            out_idx[start:end] = idx_b
             start = end
 
         return out_idx
+
         
 
 @MODELS.register_module("PointTransformer-Cls26")
