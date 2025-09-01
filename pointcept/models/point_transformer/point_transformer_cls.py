@@ -215,6 +215,9 @@ class PTv1Cls38_Features(PointTransformerCls38):
         c5 = self.enc5[0].bn.num_features
         self._stage_dims = (c1, c2, c3, c4, c5)
 
+        # start equal to pooled-only; the model can learn to use CLS
+        self.gamma_cls = nn.Parameter(torch.tensor(0.0))
+
         # -------- shared CLS dimension = last stage channels (512) ------------
         self.cls_dim = c5
 
@@ -272,7 +275,7 @@ class PTv1Cls38_Features(PointTransformerCls38):
     def forward(self, data_dict):
         # inputs
         p0   = data_dict["coord"]                  # (N,3)
-        x0in = data_dict["feat"]                   # (N,C) (often zeros if xyz-only)
+        x0in = data_dict["feat"]                   # (N,C)
         o0   = data_dict["offset"].int()           # (B,)
         inst0= data_dict.get("instance", None)     # (N,) optional per-point instance id
 
@@ -286,19 +289,23 @@ class PTv1Cls38_Features(PointTransformerCls38):
 
         # enc1..enc5 with instance-aware KNN applied to the first block of each encoder
         p1, x1, o1, inst1 = self._run_stage_with_inst_knn(self.enc1, p0, x0, o0, inst0)
-        cls = self.cls_attn1(x1, o1, cls)  # CLS cross-attends to stage-1 tokens
+        #cls = self.cls_attn1(x1, o1, cls)  # CLS cross-attends to stage-1 tokens
 
         p2, x2, o2, inst2 = self._run_stage_with_inst_knn(self.enc2, p1, x1, o1, inst1)
-        cls = self.cls_attn2(x2, o2, cls)  # stage-2
+        #cls = self.cls_attn2(x2, o2, cls)  # stage-2
 
         p3, x3, o3, inst3 = self._run_stage_with_inst_knn(self.enc3, p2, x2, o2, inst2)
-        cls = self.cls_attn3(x3, o3, cls)  # stage-3
+        #cls = self.cls_attn3(x3, o3, cls)  # stage-3
 
         p4, x4, o4, inst4 = self._run_stage_with_inst_knn(self.enc4, p3, x3, o3, inst3)
-        cls = self.cls_attn4(x4, o4, cls)  # stage-4
+        #cls = self.cls_attn4(x4, o4, cls)  # stage-4
 
         _,  x5, o5, _     = self._run_stage_with_inst_knn(self.enc5, p4, x4, o4, inst4)
         cls = self.cls_attn5(x5, o5, cls)  # stage-5
 
-        # Return the final CLS features (B, 512). DefaultClassifier will map to logits.
-        return cls
+        pooled = torch.stack(
+            [x5[(o5[i-1] if i else 0):o5[i]].mean(0) for i in range(o5.shape[0])],
+            dim=0
+        )                                        # (B, 512)
+        feats = pooled + self.gamma_cls * cls    # begins identical to pooled; learns to add CLS
+        return feats
